@@ -1,0 +1,28 @@
+[package]
+name = "nuillu-code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nuillu-code"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+eframe.workspace = true
+lutum-trace.workspace = true
+nuillu-code-module = { path = "../code" }
+nuillu-server.workspace = true
+nuillu-visualizer-egui.workspace = true
+nuillu-visualizer-protocol.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+tracing-log.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
