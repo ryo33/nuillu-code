@@ -6,10 +6,13 @@ application never opens a listening socket.
 
 ## Components
 
-`crates/code` contains one Nuillu `code` module, all four workspace tools, and their shared safety
-boundary. One persistent Premium-tier LLM session owns the module.
+`crates/code` contains one Nuillu `code` module, all four workspace tools, the Git worktree
+coordinator, and their shared safety boundary. The coding session and conflict-only LLM both use
+the Premium tier; the latter can read and patch only Git-reported conflict paths.
 
-Every cognition activates the code module; the runtime already withholds the module's own entries.
+Every cognition triggers the code module; the runtime already withholds the module's own entries.
+The trigger boundary synchronizes the parent before forming the activation batch. UI Git controls
+are also triggers, and patch calls perform one additional pre-patch synchronization.
 Whether a cognition is a coding request is the model's judgement, made by calling
 `leave_finding_unchanged`, rather than a pattern match over the cognition text. The code module is
 the only module that selects workspace tools.
@@ -21,9 +24,9 @@ contents. The module also publishes one final result for Nuillu's speaking path.
 
 `crates/nuillu-code` is the application crate. It embeds the Nuillu runtime and visualizer and owns:
 
-- the user-only write-mode toggle
-- the pending-patch UI
-- patch history
+- the Read-only, Review, and Write controls
+- the review-commit UI (`View`, `Apply`, `Discard`, and `Apply all`)
+- publication of Git changes as workspace sensory input
 - the terminal Stop control
 
 The four tools exposed by the code module are:
@@ -38,7 +41,7 @@ semantics.
 
 ## State and personality
 
-Nuillu's state directory is fixed to `<cwd>/.nuillu`:
+Nuillu's state directory is fixed to `<repository-root>/.nuillu`:
 
 ```text
 .nuillu/
@@ -46,7 +49,10 @@ Nuillu's state directory is fixed to `<cwd>/.nuillu`:
 ├── model-set.eure
 ├── memory-seeds/
 │   └── *.eure
-└── llm-logs/
+├── llm-logs/
+├── worktrees/
+│   └── <session-id>/
+└── worktree-locks/
 ```
 
 The agent's identity and personality come from Nuillu memory seeds under
@@ -56,3 +62,9 @@ in `.nuillu/agent.db`; the application imposes no additional retention or size l
 Startup fails unless the workspace root `.gitignore` explicitly contains `.nuillu/` (or the
 equivalent root-anchored form). Coding tools cannot inspect `.nuillu` because it is ignored;
 Nuillu's state subsystem accesses it directly.
+
+The parent snapshot is built with a temporary Git index, leaving the real staged/unstaged state
+unchanged. The complete startup snapshot becomes the initial observation point without producing
+sensory input. Later module triggers and patch calls publish only changes since that last observed
+parent snapshot; Nuillu's own Apply operations advance the observation point without producing
+self-sensory.

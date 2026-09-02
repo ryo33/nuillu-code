@@ -1,7 +1,8 @@
 # Security
 
-Nuillu Code deliberately exposes a small set of workspace operations. All coding tools share the
-same boundary and are confined to the canonical `--cwd` directory.
+Nuillu Code requires a non-bare Git repository with a checked-out branch. All coding tools share
+one boundary and are confined to a per-process worktree under
+`<repository-root>/.nuillu/worktrees/`; the parent is never a coding-tool root.
 
 ## Workspace boundary
 
@@ -9,7 +10,6 @@ same boundary and are confined to the canonical `--cwd` directory.
 - Symbolic links are never followed by a coding tool, even when their targets are inside `cwd`.
 - Hidden files are visible unless ignored.
 - ripgrep's normal `.gitignore`, `.ignore`, `.rgignore`, and global ignore behavior is preserved.
-- `--no-require-git` makes ignore files effective even when `cwd` is not a Git worktree.
 - Ignored files cannot be searched, listed, read, or patched.
 - The application provides no shell, arbitrary command, Git, environment, or network tool.
 
@@ -18,13 +18,17 @@ equivalent root-anchored form). This prevents local model configuration, memory,
 logs from accidentally entering the repository. Coding tools cannot inspect `.nuillu` because it
 is ignored; Nuillu's state subsystem accesses it directly.
 
-## Ripgrep execution
+## Child-process execution
 
-`rg` is the only child executable. It is found through `PATH` at startup, symlinks are resolved,
-the final executable must be outside `cwd`, and its file identity is checked before every run.
+Search and Git coordination resolve their executables once, reject executables inside the
+workspace or repository, and revalidate path, size, modification time, and (on Unix) device and
+inode identity before every invocation. Git runs with an empty environment, no system/global
+configuration, hooks, external diff, text conversion, fsmonitor, prompting, or commit signing.
+Repositories with custom clean/smudge filters are rejected; Git LFS is outside the v1 boundary.
 
-Each invocation receives an empty environment, `--no-config`, fixed arguments, a null stdin,
-bounded output, and a ten-second timeout.
+Each ripgrep invocation receives an empty environment, `--no-config`, fixed arguments, a null
+stdin, bounded output, and a ten-second timeout. Git invocations use fixed arguments and null stdin;
+operations that consume a generated patch receive only that patch through a pipe.
 
 The application itself does not constrain model-provider networking. That behavior belongs to the
 user's Nuillu model set. Coding tools and the embedded visualizer transport do not provide network
@@ -41,19 +45,31 @@ Tool output limits are intentionally small:
 Reading and patching also reject binary, non-UTF-8, and files larger than 16 MiB. Every bounded
 result explicitly reports truncation.
 
-## Write mode
+## Workspace modes
 
-Write mode always starts off and is never persisted. Only the user can change it through the egui
-toggle.
+Every run starts in Read-only and never persists the selected mode.
 
-The patch module still runs while write mode is off. It validates the structured proposal, derives
-a diff, pauses that module's tool call, and displays the proposal in the UI. At most one proposal
-can be pending. Turning write mode on applies that exact proposal automatically; Reject discards
-it. Before applying, every source is read again and its SHA-256 preimage is checked again.
+- Read-only rejects patch calls without changing either worktree.
+- Review commits each internal patch as `Nuillu Code <agent@nuillu.invalid>` and returns
+  immediately. The UI can inspect, apply, or discard independent commits in any order.
+- Write creates the same internal commit, applies its diff to the parent working tree, then removes
+  the temporary commit. It never commits on the user branch or changes the parent index.
 
-While write mode is on, valid patches apply automatically without per-patch confirmation. Turning
-write mode off stops subsequent writes. Stop rejects a pending patch, disables write mode, cancels
-the embedded runtime, and is terminal for that app run.
+Review-to-Write first applies the review queue as one transaction. Apply operations synchronize
+the parent first. If conflict resolution changes a reviewed diff, application stops until it is
+reviewed again. A failed Write transaction reverses only its own diff and discards its commit.
+
+Parent synchronization occurs only at startup, a code-module trigger (cognition or UI control),
+and immediately before a patch call. The startup snapshot establishes the observation baseline and
+is not emitted as sensory input. There is no filesystem watcher or timer polling.
+
+## Git conflict isolation
+
+Review commits are replayed onto each parent snapshot. Git determines whether a new patch applies
+independently; dependent components are recommitted together. A conflict is given to a separate
+Premium-tier resolver for at most 12 tool calls. Its tools expose only Git-reported conflict paths
+and exact replacements. Success is recommitted for review. Failure discards only that
+self-contained commit and publishes its full diff and reason as workspace sensory input.
 
 ## Patch transactions
 

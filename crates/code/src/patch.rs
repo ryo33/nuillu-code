@@ -2,16 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 
+use crate::git::ConflictResolver;
 use crate::workspace::transaction_file_name;
-use crate::{Workspace, WorkspaceToolOutput, sha256_hex};
+use crate::{
+    GitWorkspace, PatchDisposition, Workspace, WorkspaceMode, WorkspaceToolOutput, sha256_hex,
+};
 
 const MAX_OPERATIONS: usize = 32;
 const PATCH_DIFF_BYTE_LIMIT: usize = 256 * 1024;
@@ -62,272 +63,210 @@ pub struct PatchOutput {
     pub rejected: bool,
     pub changed_paths: Vec<String>,
     pub message: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PatchDecision {
-    Apply,
-    Reject,
-}
-
-pub struct PendingPatch {
-    pub purpose: String,
-    pub diff: String,
-    decision: Option<oneshot::Sender<PatchDecision>>,
-}
-
-impl PendingPatch {
-    pub fn decide(mut self, decision: PatchDecision) {
-        if let Some(sender) = self.decision.take() {
-            let _ = sender.send(decision);
-        }
-    }
-}
-
-pub enum PatchUiEvent {
-    Pending(PendingPatch),
-    Applied { purpose: String, diff: String },
-    Failed { purpose: String, message: String },
-}
-
-#[derive(Clone)]
-pub struct PatchGate {
-    write_enabled: Arc<AtomicBool>,
-    events: mpsc::Sender<PatchUiEvent>,
-}
-
-impl PatchGate {
-    pub fn new() -> (Self, mpsc::Receiver<PatchUiEvent>) {
-        let (events, receiver) = mpsc::channel();
-        (
-            Self {
-                write_enabled: Arc::new(AtomicBool::new(false)),
-                events,
-            },
-            receiver,
-        )
-    }
-
-    pub fn write_enabled(&self) -> bool {
-        self.write_enabled.load(Ordering::SeqCst)
-    }
-
-    pub fn set_write_enabled(&self, enabled: bool) {
-        self.write_enabled.store(enabled, Ordering::SeqCst);
-    }
-
-    async fn authorize(&self, purpose: String, diff: String) -> Result<PatchDecision> {
-        if self.write_enabled() {
-            return Ok(PatchDecision::Apply);
-        }
-        let (decision, receiver) = oneshot::channel();
-        self.events
-            .send(PatchUiEvent::Pending(PendingPatch {
-                purpose,
-                diff,
-                decision: Some(decision),
-            }))
-            .context("show pending patch in UI")?;
-        receiver.await.context("pending patch was cancelled")
-    }
-
-    fn applied(&self, purpose: String, diff: String) {
-        let _ = self.events.send(PatchUiEvent::Applied { purpose, diff });
-    }
-
-    fn failed(&self, purpose: String, message: String) {
-        let _ = self.events.send(PatchUiEvent::Failed { purpose, message });
-    }
+    pub mode: String,
+    #[serde(default)]
+    pub review_commit: Option<String>,
+    pub auto_applied: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct PatchExecutor {
     workspace: Workspace,
-    gate: PatchGate,
+    git: GitWorkspace,
 }
 
 impl PatchExecutor {
-    pub fn new(workspace: Workspace, gate: PatchGate) -> Self {
-        Self { workspace, gate }
+    pub fn new_git(workspace: Workspace, git: GitWorkspace) -> Self {
+        Self { workspace, git }
     }
 
-    async fn prepare(&self, input: &PatchInput) -> Result<PreparedPatch> {
-        if input.operations.is_empty() || input.operations.len() > MAX_OPERATIONS {
-            bail!("patch must contain between 1 and {MAX_OPERATIONS} operations");
+    pub async fn execute_with_resolver<R: ConflictResolver>(
+        &self,
+        input: &PatchInput,
+        resolver: &mut R,
+    ) -> Result<PatchOutput> {
+        self.git
+            .sync_with_resolver(resolver)
+            .await
+            .context("sync parent before patch")?;
+        if self.git.mode()? == WorkspaceMode::ReadOnly {
+            bail!("workspace is read-only; select Review or Write before patching");
         }
-        if input.purpose.trim().is_empty() {
-            bail!("patch purpose must not be empty");
-        }
-        let mut touched = BTreeSet::new();
-        let mut operations = Vec::with_capacity(input.operations.len());
-        for operation in &input.operations {
-            match operation {
-                PatchOperation::Create { path, content } => {
-                    claim_path(&mut touched, path)?;
-                    self.workspace.validate_new_path(path)?;
-                    operations.push(PreparedOperation::Create {
-                        path: path.clone(),
-                        after: text_bytes(content)?,
-                    });
-                }
-                PatchOperation::Update {
-                    path,
-                    preimage_sha256,
-                    replacements,
-                } => {
-                    claim_path(&mut touched, path)?;
-                    validate_hash(preimage_sha256)?;
-                    let before = self.workspace.read_visible_bytes(path).await?;
-                    verify_hash(path, &before, preimage_sha256)?;
-                    let after = apply_replacements(path, &before, replacements)?;
-                    operations.push(PreparedOperation::Update {
-                        path: path.clone(),
-                        before,
-                        after,
-                    });
-                }
-                PatchOperation::Delete {
-                    path,
-                    preimage_sha256,
-                } => {
-                    claim_path(&mut touched, path)?;
-                    validate_hash(preimage_sha256)?;
-                    let before = self.workspace.read_visible_bytes(path).await?;
-                    verify_hash(path, &before, preimage_sha256)?;
-                    operations.push(PreparedOperation::Delete {
-                        path: path.clone(),
-                        before,
-                    });
-                }
-                PatchOperation::Rename {
-                    from,
-                    to,
-                    preimage_sha256,
-                } => {
-                    claim_path(&mut touched, from)?;
-                    claim_path(&mut touched, to)?;
-                    validate_hash(preimage_sha256)?;
-                    let before = self.workspace.read_visible_bytes(from).await?;
-                    verify_hash(from, &before, preimage_sha256)?;
-                    self.workspace.validate_new_path(to)?;
-                    operations.push(PreparedOperation::Rename {
-                        from: from.clone(),
-                        to: to.clone(),
-                        before,
-                    });
-                }
+        let proposal = prepare_patch(&self.workspace, input).await?;
+        let changed_paths = apply_patch(&self.workspace, &proposal).await?;
+        let disposition =
+            self.git
+                .finish_patch(&proposal.purpose, &proposal.diff, changed_paths.clone());
+        let disposition = match disposition {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                let _ = self.git.discard_uncommitted();
+                return Err(error);
             }
-        }
-        Ok(PreparedPatch {
-            purpose: input.purpose.trim().to_owned(),
-            diff: render_diff(&operations),
-            operations,
+        };
+        let (mode, review_commit, auto_applied, message) = match disposition {
+            PatchDisposition::Review { review_commit } => (
+                "review".to_owned(),
+                Some(review_commit),
+                false,
+                "patch committed for review".to_owned(),
+            ),
+            PatchDisposition::WriteApplied => (
+                "write".to_owned(),
+                None,
+                true,
+                "patch automatically applied to the parent working tree".to_owned(),
+            ),
+        };
+        Ok(PatchOutput {
+            applied: true,
+            rejected: false,
+            changed_paths,
+            message,
+            mode,
+            review_commit,
+            auto_applied,
         })
     }
-
-    async fn apply(&self, patch: &PreparedPatch) -> Result<Vec<String>> {
-        let snapshots = snapshots(&patch.operations);
-        let created_directories = created_directories(self.workspace.root(), &patch.operations);
-        let result = self.apply_inner(patch).await;
-        if let Err(error) = result {
-            rollback(self.workspace.root(), &snapshots)
-                .context("patch failed and rollback also failed")?;
-            remove_created_directories(&created_directories)
-                .context("patch failed and directory rollback also failed")?;
-            return Err(error);
-        }
-        result
-    }
-
-    async fn apply_inner(&self, patch: &PreparedPatch) -> Result<Vec<String>> {
-        let mut changed = BTreeSet::new();
-        for operation in &patch.operations {
-            match operation {
-                PreparedOperation::Create { path, after } => {
-                    atomic_create(&self.workspace.resolve_relative(path)?, after)?;
-                    changed.insert(path.clone());
-                }
-                PreparedOperation::Update { path, after, .. } => {
-                    atomic_replace(&self.workspace.resolve_relative(path)?, after)?;
-                    changed.insert(path.clone());
-                }
-                PreparedOperation::Delete { path, .. } => {
-                    let target = self.workspace.validate_no_symlink_prefix(path, false)?;
-                    fs::remove_file(&target)
-                        .with_context(|| format!("delete {}", target.display()))?;
-                    changed.insert(path.clone());
-                }
-                PreparedOperation::Rename { from, to, .. } => {
-                    let source = self.workspace.validate_no_symlink_prefix(from, false)?;
-                    let destination = self.workspace.validate_new_path(to)?;
-                    create_parent(&destination)?;
-                    fs::hard_link(&source, &destination).with_context(|| {
-                        format!(
-                            "link {} to {} without replacing",
-                            source.display(),
-                            destination.display()
-                        )
-                    })?;
-                    fs::remove_file(&source)
-                        .with_context(|| format!("remove renamed source {}", source.display()))?;
-                    changed.insert(from.clone());
-                    changed.insert(to.clone());
-                }
-            }
-        }
-        for operation in &patch.operations {
-            let resulting_path = match operation {
-                PreparedOperation::Create { path, .. } | PreparedOperation::Update { path, .. } => {
-                    Some(path)
-                }
-                PreparedOperation::Rename { to, .. } => Some(to),
-                PreparedOperation::Delete { .. } => None,
-            };
-            if let Some(path) = resulting_path
-                && !self.workspace.is_visible_existing(path).await?
-            {
-                bail!("resulting path is ignored by ripgrep: {path}");
-            }
-        }
-        Ok(changed.into_iter().collect())
-    }
 }
 
-impl PatchExecutor {
-    pub async fn execute(&self, input: &PatchInput) -> Result<PatchOutput> {
-        let proposal = self.prepare(input).await?;
-        let decision = self
-            .gate
-            .authorize(proposal.purpose.clone(), proposal.diff.clone())
-            .await?;
-        if decision == PatchDecision::Reject {
-            return Ok(PatchOutput {
-                applied: false,
-                rejected: true,
-                changed_paths: Vec::new(),
-                message: "user rejected the pending patch".to_owned(),
-            });
-        }
-        // Re-read and re-hash after approval. A stale proposal always fails closed.
-        let proposal = self.prepare(input).await?;
-        match self.apply(&proposal).await {
-            Ok(changed_paths) => {
-                self.gate
-                    .applied(proposal.purpose.clone(), proposal.diff.clone());
-                Ok(PatchOutput {
-                    applied: true,
-                    rejected: false,
-                    changed_paths,
-                    message: "patch transaction applied".to_owned(),
-                })
+async fn prepare_patch(workspace: &Workspace, input: &PatchInput) -> Result<PreparedPatch> {
+    if input.operations.is_empty() || input.operations.len() > MAX_OPERATIONS {
+        bail!("patch must contain between 1 and {MAX_OPERATIONS} operations");
+    }
+    if input.purpose.trim().is_empty() {
+        bail!("patch purpose must not be empty");
+    }
+    let mut touched = BTreeSet::new();
+    let mut operations = Vec::with_capacity(input.operations.len());
+    for operation in &input.operations {
+        match operation {
+            PatchOperation::Create { path, content } => {
+                claim_path(&mut touched, path)?;
+                workspace.validate_new_path(path)?;
+                operations.push(PreparedOperation::Create {
+                    path: path.clone(),
+                    after: text_bytes(content)?,
+                });
             }
-            Err(error) => {
-                self.gate
-                    .failed(proposal.purpose.clone(), format!("{error:#}"));
-                Err(error)
+            PatchOperation::Update {
+                path,
+                preimage_sha256,
+                replacements,
+            } => {
+                claim_path(&mut touched, path)?;
+                validate_hash(preimage_sha256)?;
+                let before = workspace.read_visible_bytes(path).await?;
+                verify_hash(path, &before, preimage_sha256)?;
+                let after = apply_replacements(path, &before, replacements)?;
+                operations.push(PreparedOperation::Update {
+                    path: path.clone(),
+                    before,
+                    after,
+                });
+            }
+            PatchOperation::Delete {
+                path,
+                preimage_sha256,
+            } => {
+                claim_path(&mut touched, path)?;
+                validate_hash(preimage_sha256)?;
+                let before = workspace.read_visible_bytes(path).await?;
+                verify_hash(path, &before, preimage_sha256)?;
+                operations.push(PreparedOperation::Delete {
+                    path: path.clone(),
+                    before,
+                });
+            }
+            PatchOperation::Rename {
+                from,
+                to,
+                preimage_sha256,
+            } => {
+                claim_path(&mut touched, from)?;
+                claim_path(&mut touched, to)?;
+                validate_hash(preimage_sha256)?;
+                let before = workspace.read_visible_bytes(from).await?;
+                verify_hash(from, &before, preimage_sha256)?;
+                workspace.validate_new_path(to)?;
+                operations.push(PreparedOperation::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                    before,
+                });
             }
         }
     }
+    Ok(PreparedPatch {
+        purpose: input.purpose.trim().to_owned(),
+        diff: render_diff(&operations),
+        operations,
+    })
+}
+
+async fn apply_patch(workspace: &Workspace, patch: &PreparedPatch) -> Result<Vec<String>> {
+    let snapshots = snapshots(&patch.operations);
+    let created_directories = created_directories(workspace.root(), &patch.operations);
+    let result = apply_patch_inner(workspace, patch).await;
+    if let Err(error) = result {
+        rollback(workspace.root(), &snapshots).context("patch failed and rollback also failed")?;
+        remove_created_directories(&created_directories)
+            .context("patch failed and directory rollback also failed")?;
+        return Err(error);
+    }
+    result
+}
+
+async fn apply_patch_inner(workspace: &Workspace, patch: &PreparedPatch) -> Result<Vec<String>> {
+    let mut changed = BTreeSet::new();
+    for operation in &patch.operations {
+        match operation {
+            PreparedOperation::Create { path, after } => {
+                atomic_create(&workspace.resolve_relative(path)?, after)?;
+                changed.insert(path.clone());
+            }
+            PreparedOperation::Update { path, after, .. } => {
+                atomic_replace(&workspace.resolve_relative(path)?, after)?;
+                changed.insert(path.clone());
+            }
+            PreparedOperation::Delete { path, .. } => {
+                let target = workspace.validate_no_symlink_prefix(path, false)?;
+                fs::remove_file(&target).with_context(|| format!("delete {}", target.display()))?;
+                changed.insert(path.clone());
+            }
+            PreparedOperation::Rename { from, to, .. } => {
+                let source = workspace.validate_no_symlink_prefix(from, false)?;
+                let destination = workspace.validate_new_path(to)?;
+                create_parent(&destination)?;
+                fs::hard_link(&source, &destination).with_context(|| {
+                    format!(
+                        "link {} to {} without replacing",
+                        source.display(),
+                        destination.display()
+                    )
+                })?;
+                fs::remove_file(&source)
+                    .with_context(|| format!("remove renamed source {}", source.display()))?;
+                changed.insert(from.clone());
+                changed.insert(to.clone());
+            }
+        }
+    }
+    for operation in &patch.operations {
+        let resulting_path = match operation {
+            PreparedOperation::Create { path, .. } | PreparedOperation::Update { path, .. } => {
+                Some(path)
+            }
+            PreparedOperation::Rename { to, .. } => Some(to),
+            PreparedOperation::Delete { .. } => None,
+        };
+        if let Some(path) = resulting_path
+            && !workspace.is_visible_existing(path).await?
+        {
+            bail!("resulting path is ignored by ripgrep: {path}");
+        }
+    }
+    Ok(changed.into_iter().collect())
 }
 
 #[derive(Clone, Debug)]
@@ -626,8 +565,6 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::test_support::TempWorkspace;
 
@@ -650,9 +587,7 @@ mod tests {
         let temp = TempWorkspace::new("patch-duplicate");
         temp.write(".gitignore", ".nuillu/\n");
         temp.write("a.txt", "old\n");
-        let (gate, _events) = PatchGate::new();
-        gate.set_write_enabled(true);
-        let tool = PatchExecutor::new(temp.open(), gate);
+        let workspace = temp.open();
         let hash = sha256_hex(b"old\n");
         let input = PatchInput {
             purpose: "touch one path twice".to_owned(),
@@ -672,7 +607,7 @@ mod tests {
                 },
             ],
         };
-        assert!(tool.execute(&input).await.is_err());
+        assert!(prepare_patch(&workspace, &input).await.is_err());
         assert_eq!(temp.read("a.txt"), b"old\n");
     }
 
@@ -733,9 +668,7 @@ mod tests {
         let temp = TempWorkspace::new("patch-preimage");
         temp.write(".gitignore", ".nuillu/\n");
         temp.write("a.txt", "old\n");
-        let (gate, _events) = PatchGate::new();
-        gate.set_write_enabled(true);
-        let tool = PatchExecutor::new(temp.open(), gate);
+        let workspace = temp.open();
         let input = PatchInput {
             purpose: "update from a stale read".to_owned(),
             operations: vec![PatchOperation::Update {
@@ -748,7 +681,7 @@ mod tests {
                 }],
             }],
         };
-        assert!(tool.execute(&input).await.is_err());
+        assert!(prepare_patch(&workspace, &input).await.is_err());
         assert_eq!(temp.read("a.txt"), b"old\n");
         assert!(
             validate_hash("not-a-sha256").is_err(),
@@ -761,9 +694,7 @@ mod tests {
         let temp = TempWorkspace::new("patch-rollback");
         temp.write(".gitignore", ".nuillu/\ngenerated/\n");
         temp.write("a.txt", "old\n");
-        let (gate, _events) = PatchGate::new();
-        gate.set_write_enabled(true);
-        let tool = PatchExecutor::new(temp.open(), gate);
+        let workspace = temp.open();
         // The second operation lands on an ignored path, which fails after the
         // first operation has already been written.
         let input = PatchInput {
@@ -784,59 +715,12 @@ mod tests {
                 },
             ],
         };
-        assert!(tool.execute(&input).await.is_err());
+        let patch = prepare_patch(&workspace, &input).await.unwrap();
+        assert!(apply_patch(&workspace, &patch).await.is_err());
         assert_eq!(temp.read("a.txt"), b"old\n");
         assert!(
             !temp.root().join("generated").exists(),
             "rollback must also remove the directory it created"
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_pending_patch_applies_when_write_mode_is_enabled() {
-        let temp = TempWorkspace::new("patch-pending");
-        temp.write(".gitignore", ".nuillu/\n");
-        temp.write("a.txt", "old\n");
-        let (gate, events) = PatchGate::new();
-        let tool = PatchExecutor::new(temp.open(), gate.clone());
-        assert!(!gate.write_enabled());
-        let input = PatchInput {
-            purpose: "apply after explicit toggle".to_owned(),
-            operations: vec![PatchOperation::Update {
-                path: "a.txt".to_owned(),
-                preimage_sha256: sha256_hex(b"old\n"),
-                replacements: vec![Replacement {
-                    old: "old".to_owned(),
-                    new: "new".to_owned(),
-                    expected_occurrences: 1,
-                }],
-            }],
-        };
-        let execute = tool.execute(&input);
-        let approve = async {
-            loop {
-                match events.try_recv() {
-                    Ok(PatchUiEvent::Pending(pending)) => {
-                        gate.set_write_enabled(true);
-                        pending.decide(PatchDecision::Apply);
-                        return;
-                    }
-                    Ok(_) | Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        panic!("patch UI channel disconnected")
-                    }
-                }
-            }
-        };
-        // Without the timeout a patch that never reaches the UI would hang the
-        // whole suite instead of failing.
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async move {
-            tokio::join!(execute, approve)
-        })
-        .await
-        .expect("the patch never became pending in the UI");
-
-        assert!(result.unwrap().applied);
-        assert_eq!(temp.read("a.txt"), b"new\n");
     }
 }

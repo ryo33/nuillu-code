@@ -1,10 +1,13 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use nuillu_code_module::{PatchDecision, PatchGate, PatchUiEvent, PendingPatch, Workspace};
+use nuillu_code_module::{
+    GitControlCommand, GitControlHandle, GitUiEvent, GitUiState, GitWorkspace, WorkspaceMode,
+};
 use nuillu_server::{
     RuntimeModule, Server, ServerBootConfig, ServerRunOptions, ServerRuntimeHandle,
     load_server_config_from_options,
@@ -21,13 +24,18 @@ const SERVER_MESSAGES_PER_FRAME: usize = 256;
 fn main() -> Result<()> {
     install_trace_subscriber()?;
     let args = Args::parse();
-    let workspace = Workspace::open(&args.cwd)?;
+    let open = GitWorkspace::open(&args.cwd)?;
+    let workspace = open.workspace;
+    let git = open.git;
+    let controls = open.controls;
+    let control_receiver = open.control_receiver;
+    let git_events = open.ui_events;
+    let state_dir = open.state_dir;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build startup validation runtime")?
         .block_on(workspace.verify_state_dir_is_ignored())?;
-    let state_dir = workspace.state_dir();
     let mut config = load_server_config_from_options(ServerRunOptions {
         state_dir: state_dir.clone(),
         run_id: None,
@@ -42,10 +50,10 @@ fn main() -> Result<()> {
     config.boot_config = coding_agent_boot_config();
     config.disabled_modules.clear();
 
-    let (patch_gate, patch_events) = PatchGate::new();
     let registrars = vec![nuillu_code_module::registrar(
         workspace.clone(),
-        patch_gate.clone(),
+        git.clone(),
+        control_receiver,
     )];
     let runtime = Server::new(config)
         .module_registrars(registrars)
@@ -54,7 +62,10 @@ fn main() -> Result<()> {
     let (server_messages, client_messages) = runtime.visualizer_channels();
     let app_runtime = runtime.clone();
     let native_options = native_options();
-    let title = format!("Nuillu Code — {}", workspace.root().display());
+    let title = format!(
+        "Nuillu Code — {}",
+        state_dir.parent().unwrap_or(&state_dir).display()
+    );
     let result = eframe::run_native(
         &title,
         native_options,
@@ -63,8 +74,8 @@ fn main() -> Result<()> {
                 server_messages,
                 client_messages,
                 app_runtime,
-                patch_gate,
-                patch_events,
+                controls,
+                git_events,
             )))
         }),
     );
@@ -74,6 +85,7 @@ fn main() -> Result<()> {
         Ok(false) => eprintln!("embedded Nuillu runtime did not stop within two seconds"),
         Err(error) => eprintln!("embedded Nuillu runtime failed during shutdown: {error:#}"),
     }
+    let _ = git.cleanup();
     result.map_err(anyhow::Error::msg)
 }
 
@@ -124,40 +136,13 @@ struct NuilluCodeApp {
     server_messages: Receiver<VisualizerServerMessage>,
     client_messages: Sender<VisualizerClientMessage>,
     runtime: ServerRuntimeHandle,
-    patch_gate: PatchGate,
-    patch_events: Receiver<PatchUiEvent>,
-    pending_patch: Option<PendingPatch>,
-    patch_log: Vec<PatchLogEntry>,
+    controls: GitControlHandle,
+    git_events: Receiver<GitUiEvent>,
+    git_state: Option<GitUiState>,
+    errors: Vec<String>,
+    expanded_commits: BTreeSet<String>,
     patch_window_open: bool,
-    write_enabled: bool,
     stopped: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PatchLogKind {
-    Applying,
-    Approved,
-    Applied,
-    Rejected,
-    Failed,
-}
-
-impl PatchLogKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Applying => "Applying",
-            Self::Approved => "Approved",
-            Self::Applied => "Applied",
-            Self::Rejected => "Rejected",
-            Self::Failed => "Failed",
-        }
-    }
-}
-
-struct PatchLogEntry {
-    kind: PatchLogKind,
-    purpose: String,
-    body: String,
 }
 
 impl NuilluCodeApp {
@@ -165,10 +150,9 @@ impl NuilluCodeApp {
         server_messages: Receiver<VisualizerServerMessage>,
         client_messages: Sender<VisualizerClientMessage>,
         runtime: ServerRuntimeHandle,
-        patch_gate: PatchGate,
-        patch_events: Receiver<PatchUiEvent>,
+        controls: GitControlHandle,
+        git_events: Receiver<GitUiEvent>,
     ) -> Self {
-        patch_gate.set_write_enabled(false);
         Self {
             visualizer: Visualizer::with_config(
                 eframe::egui::Id::new("nuillu-code-visualizer"),
@@ -177,12 +161,12 @@ impl NuilluCodeApp {
             server_messages,
             client_messages,
             runtime,
-            patch_gate,
-            patch_events,
-            pending_patch: None,
-            patch_log: Vec::new(),
+            controls,
+            git_events,
+            git_state: None,
+            errors: Vec::new(),
+            expanded_commits: BTreeSet::new(),
             patch_window_open: false,
-            write_enabled: false,
             stopped: false,
         }
     }
@@ -201,108 +185,70 @@ impl NuilluCodeApp {
         context.request_repaint();
     }
 
-    fn drain_patch_events(&mut self, context: &eframe::egui::Context) {
-        while let Ok(event) = self.patch_events.try_recv() {
+    fn drain_git_events(&mut self, context: &eframe::egui::Context) {
+        while let Ok(event) = self.git_events.try_recv() {
             match event {
-                PatchUiEvent::Pending(pending) => {
-                    if self.write_enabled {
-                        self.patch_log.push(PatchLogEntry {
-                            kind: PatchLogKind::Applying,
-                            purpose: pending.purpose.clone(),
-                            body: pending.diff.clone(),
-                        });
-                        pending.decide(PatchDecision::Apply);
-                    } else {
-                        self.pending_patch = Some(pending);
+                GitUiEvent::State(state) => {
+                    if !state.commits.is_empty() {
                         self.patch_window_open = true;
                     }
+                    self.git_state = Some(state);
                 }
-                PatchUiEvent::Applied { purpose, diff } => {
-                    self.patch_log.push(PatchLogEntry {
-                        kind: PatchLogKind::Applied,
-                        purpose,
-                        body: diff,
-                    });
+                GitUiEvent::Error(message) => {
+                    self.errors.push(message);
+                    self.patch_window_open = true;
                 }
-                PatchUiEvent::Failed { purpose, message } => {
-                    self.patch_log.push(PatchLogEntry {
-                        kind: PatchLogKind::Failed,
-                        purpose,
-                        body: message,
-                    });
+                GitUiEvent::Sensory(content) => {
+                    if let Err(error) =
+                        self.runtime
+                            .send_one_shot("vision", Some("workspace".to_owned()), content)
+                    {
+                        self.errors.push(format!(
+                            "failed to publish workspace sensory input: {error:#}"
+                        ));
+                    }
                 }
             }
             context.request_repaint();
         }
     }
 
-    fn set_write_enabled(&mut self, enabled: bool) {
-        self.write_enabled = enabled;
-        self.patch_gate.set_write_enabled(enabled);
-        if enabled && let Some(pending) = self.pending_patch.take() {
-            self.patch_log.push(PatchLogEntry {
-                kind: PatchLogKind::Approved,
-                purpose: pending.purpose.clone(),
-                body: pending.diff.clone(),
-            });
-            pending.decide(PatchDecision::Apply);
-        }
-    }
-
-    fn reject_pending(&mut self) {
-        if let Some(pending) = self.pending_patch.take() {
-            self.patch_log.push(PatchLogEntry {
-                kind: PatchLogKind::Rejected,
-                purpose: pending.purpose.clone(),
-                body: pending.diff.clone(),
-            });
-            pending.decide(PatchDecision::Reject);
-        }
-    }
-
     fn stop(&mut self) {
-        self.reject_pending();
-        self.set_write_enabled(false);
         let _ = self.runtime.shutdown();
         self.stopped = true;
     }
 
     fn controls(&mut self, ui: &mut eframe::egui::Ui) {
         ui.horizontal(|ui| {
-            let mut enabled = self.write_enabled;
-            if ui
-                .add_enabled(
-                    !self.stopped,
-                    eframe::egui::Checkbox::new(&mut enabled, "Write mode"),
-                )
-                .changed()
-            {
-                self.set_write_enabled(enabled);
+            let current = self.git_state.as_ref().map(|state| state.mode);
+            for (mode, label) in [
+                (WorkspaceMode::ReadOnly, "Read-only"),
+                (WorkspaceMode::Review, "Review"),
+                (WorkspaceMode::Write, "Write"),
+            ] {
+                if ui
+                    .add_enabled(
+                        !self.stopped && current.is_some(),
+                        eframe::egui::Button::new(label).selected(current == Some(mode)),
+                    )
+                    .clicked()
+                    && let Err(error) = self.controls.send(GitControlCommand::SetMode(mode))
+                {
+                    self.errors.push(format!("{error:#}"));
+                }
             }
-            let status = if self.stopped {
-                "stopped"
-            } else if self.pending_patch.is_some() {
-                "waiting for write mode"
-            } else if self.write_enabled {
-                "automatic writes enabled"
-            } else {
-                "read only"
-            };
-            ui.monospace(status);
+            if let Some(state) = &self.git_state {
+                ui.monospace(format!(
+                    "{} · {} pending",
+                    state.branch,
+                    state.commits.len()
+                ));
+            }
             if ui
                 .selectable_label(self.patch_window_open, "Patches")
                 .clicked()
             {
                 self.patch_window_open = !self.patch_window_open;
-            }
-            if ui
-                .add_enabled(
-                    self.pending_patch.is_some(),
-                    eframe::egui::Button::new("Reject"),
-                )
-                .clicked()
-            {
-                self.reject_pending();
             }
             if ui
                 .add_enabled(!self.stopped, eframe::egui::Button::new("Stop"))
@@ -314,20 +260,53 @@ impl NuilluCodeApp {
     }
 
     fn patch_panel(&mut self, ui: &mut eframe::egui::Ui) {
-        if let Some(pending) = &self.pending_patch {
-            ui.colored_label(eframe::egui::Color32::YELLOW, "Waiting for write mode");
-            ui.label(&pending.purpose);
-            eframe::egui::ScrollArea::vertical()
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    ui.monospace(&pending.diff);
-                });
-            ui.separator();
+        let commits = self
+            .git_state
+            .as_ref()
+            .map(|state| state.commits.clone())
+            .unwrap_or_default();
+        if !commits.is_empty()
+            && ui.button("Apply all").clicked()
+            && let Err(error) = self.controls.send(GitControlCommand::ApplyAll)
+        {
+            self.errors.push(format!("{error:#}"));
         }
         eframe::egui::ScrollArea::vertical().show(ui, |ui| {
-            for entry in self.patch_log.iter().rev() {
-                ui.strong(format!("{}: {}", entry.kind.label(), entry.purpose));
-                ui.monospace(&entry.body);
+            for commit in commits.iter().rev() {
+                ui.strong(&commit.purpose);
+                ui.monospace(&commit.id);
+                ui.label(commit.changed_paths.join(", "));
+                ui.horizontal(|ui| {
+                    let expanded = self.expanded_commits.contains(&commit.id);
+                    if ui.button(if expanded { "Hide" } else { "View" }).clicked() {
+                        if expanded {
+                            self.expanded_commits.remove(&commit.id);
+                        } else {
+                            self.expanded_commits.insert(commit.id.clone());
+                        }
+                    }
+                    if ui.button("Apply").clicked()
+                        && let Err(error) = self
+                            .controls
+                            .send(GitControlCommand::Apply(commit.id.clone()))
+                    {
+                        self.errors.push(format!("{error:#}"));
+                    }
+                    if ui.button("Discard").clicked()
+                        && let Err(error) = self
+                            .controls
+                            .send(GitControlCommand::Discard(commit.id.clone()))
+                    {
+                        self.errors.push(format!("{error:#}"));
+                    }
+                });
+                if self.expanded_commits.contains(&commit.id) {
+                    ui.monospace(&commit.diff);
+                }
+                ui.separator();
+            }
+            for error in self.errors.iter().rev() {
+                ui.colored_label(eframe::egui::Color32::RED, error);
                 ui.separator();
             }
         });
@@ -352,7 +331,7 @@ impl NuilluCodeApp {
 impl eframe::App for NuilluCodeApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_server_messages(ui.ctx());
-        self.drain_patch_events(ui.ctx());
+        self.drain_git_events(ui.ctx());
         self.controls(ui);
         ui.separator();
         for message in self.visualizer.show(ui).into_messages() {

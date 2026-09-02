@@ -4,6 +4,11 @@ Nuillu Code is a deliberately small coding agent with a native `eframe` UI. The 
 and `nuillu-visualizer-egui` run in the same process and communicate only through in-process
 channels. The application never opens a listening socket.
 
+Every run requires a non-bare Git repository with a checked-out branch. The agent works in an
+ignored, per-process Git worktree and exposes Read-only, Review, and Write modes. Review keeps
+agent changes as commits until the user applies or discards them; Write applies each temporary
+agent commit to the parent working tree without committing or changing its index.
+
 The agent has exactly four workspace tools:
 
 - `search`: ripgrep regular-expression search
@@ -22,15 +27,19 @@ Requirements:
 
 - the pinned Rust toolchain from `rust-toolchain.toml`
 - `rg` available through `PATH`
-- `<cwd>/.gitignore` containing `.nuillu/`
-- `<cwd>/.nuillu/model-set.eure`
-- optional memory seed Eure files under `<cwd>/.nuillu/memory-seeds/`
+- `<repository-root>/.gitignore` containing `.nuillu/`
+- `<repository-root>/.nuillu/model-set.eure`
+- optional memory seed Eure files under `<repository-root>/.nuillu/memory-seeds/`
 
 Run from this repository against the current directory:
 
 ```console
 cargo run -p nuillu-code -- --cwd .
 ```
+
+`--cwd` may name any directory inside the repository; Nuillu Code discovers the repository root.
+Git LFS and custom clean/smudge filters are rejected because startup must not execute
+repository-configured processes.
 
 To back up the existing agent database and start with a fresh one, pass Nuillu's standard flag:
 
@@ -52,8 +61,9 @@ cargo check --workspace --offline
 cargo fmt --check
 ```
 
-Tests cover path escape rejection, glob semantics and worst-case matching cost, ignore behavior
-outside Git worktrees, hidden files, symlink rejection, output bounds, exact replacement counts,
-preimage conflicts, duplicate-path rejection, ignored-destination rejection, transaction rollback,
-pending-patch approval, changed-region diff rendering, duplicate tool calls compared by value, and
-the redaction of tool content from cognitive observations.
+Tests cover Git snapshots and index preservation, Review and Write application, dependency
+grouping, conflict replay, startup-baseline and sensory-origin tracking, branch changes, executable
+identity, glob semantics and worst-case matching cost, ignore behavior, path escape and symlink
+rejection, output bounds, preimage conflicts, duplicate-path and ignored-destination rejection,
+exact replacement counts, transaction rollback, changed-region diff rendering, duplicate tool
+calls, and redaction of tool content from cognitive observations.
